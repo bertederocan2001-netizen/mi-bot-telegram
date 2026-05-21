@@ -1,0 +1,1761 @@
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+TOKEN = "8611741385:AAHYvMK0d7_EVUVakeXgX_XnSUEhu64myxg"
+GRUPO_ID = -1003948274070
+ADMIN_IDS = [8356654186]
+
+MONEDAS = ["CUP", "MLC", "USD", "USDT", "TRX"]
+
+db = sqlite3.connect("bot_cartera.db", check_same_thread=False)
+cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS usuarios (
+    user_id INTEGER PRIMARY KEY,
+    nombre TEXT,
+    username TEXT,
+    moneda_actual TEXT DEFAULT 'TRX',
+    cup REAL DEFAULT 0,
+    mlc REAL DEFAULT 0,
+    usd REAL DEFAULT 0,
+    usdt REAL DEFAULT 0,
+    trx REAL DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS depositos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    chat_id INTEGER,
+    metodo TEXT,
+    numero TEXT,
+    moneda TEXT,
+    monto REAL,
+    file_id TEXT,
+    estado TEXT DEFAULT 'pendiente',
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS retiros (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    chat_id INTEGER,
+    moneda TEXT,
+    monto REAL,
+    cuenta TEXT,
+    estado TEXT DEFAULT 'pendiente',
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS historial (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    tipo TEXT,
+    moneda TEXT,
+    monto REAL,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER,
+    accion TEXT,
+    detalle TEXT,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+db.commit()
+# =========================================
+# FUNCIONES BASE
+# =========================================
+
+def log_admin(admin_id, accion, detalle):
+    cursor.execute(
+        "INSERT INTO logs (admin_id, accion, detalle) VALUES (?, ?, ?)",
+        (admin_id, accion, detalle)
+    )
+    db.commit()
+
+
+def crear_usuario(usuario):
+    username = usuario.username if usuario.username else "Sin username"
+
+    cursor.execute(
+        "SELECT user_id FROM usuarios WHERE user_id=?",
+        (usuario.id,)
+    )
+
+    existe = cursor.fetchone()
+
+    if not existe:
+        cursor.execute(
+            "INSERT INTO usuarios (user_id, nombre, username) VALUES (?, ?, ?)",
+            (usuario.id, usuario.first_name, username)
+        )
+    else:
+        cursor.execute(
+            "UPDATE usuarios SET nombre=?, username=? WHERE user_id=?",
+            (usuario.first_name, username, usuario.id)
+        )
+
+    db.commit()
+
+
+def get_moneda(user_id):
+    cursor.execute(
+        "SELECT moneda_actual FROM usuarios WHERE user_id=?",
+        (user_id,)
+    )
+
+    r = cursor.fetchone()
+
+    if r:
+        return r[0]
+
+    return "TRX"
+
+
+def set_moneda(user_id, moneda):
+    cursor.execute(
+        "UPDATE usuarios SET moneda_actual=? WHERE user_id=?",
+        (moneda, user_id)
+    )
+
+    db.commit()
+
+
+def get_saldo(user_id, moneda):
+    moneda = moneda.lower()
+
+    cursor.execute(
+        f"SELECT {moneda} FROM usuarios WHERE user_id=?",
+        (user_id,)
+    )
+
+    r = cursor.fetchone()
+
+    if r:
+        return float(r[0])
+
+    return 0.0
+
+
+def add_saldo(user_id, moneda, monto):
+    moneda = moneda.lower()
+
+    saldo_actual = get_saldo(user_id, moneda)
+    nuevo = saldo_actual + float(monto)
+
+    cursor.execute(
+        f"UPDATE usuarios SET {moneda}=? WHERE user_id=?",
+        (nuevo, user_id)
+    )
+
+    db.commit()
+
+    return nuevo
+
+
+def quitar_saldo(user_id, moneda, monto):
+    moneda = moneda.lower()
+
+    saldo_actual = get_saldo(user_id, moneda)
+
+    if saldo_actual < monto:
+        return None
+
+    nuevo = saldo_actual - float(monto)
+
+    cursor.execute(
+        f"UPDATE usuarios SET {moneda}=? WHERE user_id=?",
+        (nuevo, user_id)
+    )
+
+    db.commit()
+
+    return nuevo
+
+
+def guardar_historial(user_id, tipo, moneda, monto):
+    cursor.execute(
+        "INSERT INTO historial (user_id, tipo, moneda, monto) VALUES (?, ?, ?, ?)",
+        (user_id, tipo, moneda, monto)
+    )
+
+    db.commit()
+
+
+def tiene_deposito_pendiente(user_id):
+    cursor.execute(
+        "SELECT id FROM depositos WHERE user_id=? AND estado='pendiente'",
+        (user_id,)
+    )
+
+    return cursor.fetchone() is not None
+
+
+def tiene_retiro_pendiente(user_id):
+    cursor.execute(
+        "SELECT id FROM retiros WHERE user_id=? AND estado='pendiente'",
+        (user_id,)
+    )
+
+    return cursor.fetchone() is not None
+
+
+def es_primer_deposito(user_id):
+    cursor.execute(
+        "SELECT COUNT(*) FROM depositos WHERE user_id=? AND estado='aprobado'",
+        (user_id,)
+    )
+
+    cantidad = cursor.fetchone()[0]
+
+    return cantidad == 0
+
+
+# =========================================
+# BORRAR MENSAJE ANTERIOR
+# =========================================
+async def borrar_anterior(chat_id, context):
+
+    try:
+        ultimo = context.chat_data.get("ultimo_mensaje")
+
+        if ultimo:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=ultimo
+            )
+
+    except:
+        pass
+
+
+# =========================================
+# MENU PRINCIPAL
+# =========================================
+async def menu_principal(chat_id, context, user_id=None):
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎯 Apostar",
+                callback_data="apostar"
+            ),
+
+            InlineKeyboardButton(
+                "💰 Mi dinero",
+                callback_data="dinero"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🎮 Juegos",
+                callback_data="juegos"
+            ),
+
+            InlineKeyboardButton(
+                "➕ Más",
+                callback_data="mas"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "❓ Ayuda",
+                callback_data="ayuda"
+            )
+        ]
+    ]
+
+    # =========================================
+    # BOTONES SOLO ADMIN
+    # =========================================
+    if user_id in ADMIN_IDS:
+
+        keyboard.append([
+
+            InlineKeyboardButton(
+                "👑 Panel Admin",
+                callback_data="admin_panel"
+            )
+        ])
+
+        keyboard.append([
+
+            InlineKeyboardButton(
+                "📜 Logs",
+                callback_data="admin_logs"
+            ),
+
+            InlineKeyboardButton(
+                "📊 Stats",
+                callback_data="admin_stats"
+            )
+        ])
+
+        keyboard.append([
+
+            InlineKeyboardButton(
+                "📥 Depósitos",
+                callback_data="admin_depositos"
+            ),
+
+            InlineKeyboardButton(
+                "💸 Retiros",
+                callback_data="admin_retiros"
+            )
+        ])
+
+    mensaje = await context.bot.send_message(
+
+        chat_id=chat_id,
+
+        text="🔥 Bienvenido al bot 🔥",
+
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    context.chat_data[
+        "ultimo_mensaje"
+    ] = mensaje.message_id
+
+
+# =========================================
+# START
+# =========================================
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    crear_usuario(update.effective_user)
+
+    context.user_data.clear()
+
+    await borrar_anterior(
+        update.effective_chat.id,
+        context
+    )
+
+    await menu_principal(
+        update.effective_chat.id,
+        context,
+        update.effective_user.id
+    )
+
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+
+# =========================================
+# BOTONES
+# =========================================
+async def botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except:
+        pass
+
+    data = query.data
+
+    usuario = update.effective_user
+    user_id = usuario.id
+
+    crear_usuario(usuario)
+
+    # =========================================
+    # MI DINERO
+    # =========================================
+    if data == "dinero":
+
+        moneda = get_moneda(user_id)
+        saldo = get_saldo(user_id, moneda)
+
+        keyboard = [
+            [
+                InlineKeyboardButton("💳 Depositar", callback_data="depositar"),
+                InlineKeyboardButton("💸 Retirar", callback_data="retirar")
+            ],
+            [
+                InlineKeyboardButton("🔄 Cambiar cuenta", callback_data="cambio_cuenta")
+            ],
+            [
+                InlineKeyboardButton("📜 Historial", callback_data="historial")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Atrás", callback_data="menu")
+            ]
+        ]
+
+        await query.edit_message_text(
+            text=(
+                "💰 MI DINERO\n\n"
+                f"🏆 Moneda actual: {moneda}\n"
+                f"💵 Saldo disponible: {saldo} {moneda}\n\n"
+                "🎁 Primer depósito aprobado recibe 20% extra\n\n"
+                "👇 Elige una opción:"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # =========================================
+    # CAMBIAR CUENTA
+    # =========================================
+    elif data == "cambio_cuenta":
+
+        moneda_actual = get_moneda(user_id)
+
+        emojis = {
+            "CUP": "🇨🇺 CUP",
+            "MLC": "💳 MLC",
+            "USD": "💵 USD",
+            "USDT": "🪙 USDT",
+            "TRX": "🔶 TRX"
+        }
+
+        keyboard = []
+
+        for moneda in MONEDAS:
+
+            saldo = get_saldo(user_id, moneda)
+
+            if moneda == moneda_actual:
+                texto = f"✅ {emojis[moneda]} • Actual • {saldo}"
+            else:
+                texto = f"{emojis[moneda]} • {saldo}"
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    texto,
+                    callback_data=f"moneda_{moneda}"
+                )
+            ])
+
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+        ])
+
+        await query.edit_message_text(
+            text=(
+                "🔄 CAMBIO DE CUENTA\n\n"
+                f"👤 Usuario: {usuario.first_name}\n"
+                f"🆔 ID: {usuario.id}\n\n"
+                f"🏆 Cuenta actual: {moneda_actual}\n\n"
+                "👇 Elige la moneda que quieres usar:"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # =========================================
+    # SELECCIONAR MONEDA
+    # =========================================
+    elif data.startswith("moneda_"):
+
+        nueva = data.replace("moneda_", "")
+
+        if nueva not in MONEDAS:
+            return
+
+        set_moneda(user_id, nueva)
+
+        saldo = get_saldo(user_id, nueva)
+
+        keyboard = [
+            [
+                InlineKeyboardButton("💳 Depositar", callback_data="depositar"),
+                InlineKeyboardButton("💰 Mi dinero", callback_data="dinero")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+            ]
+        ]
+
+        await query.edit_message_text(
+            text=(
+                "✅ CUENTA CAMBIADA\n\n"
+                f"🏆 Ahora usas: {nueva}\n"
+                f"💰 Saldo: {saldo} {nueva}"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # =========================================
+    # DEPOSITAR
+    # =========================================
+    elif data == "depositar":
+
+        if tiene_deposito_pendiente(user_id):
+
+            await query.edit_message_text(
+                text=(
+                    "⏳ Ya tienes un depósito pendiente.\n\n"
+                    "Debes esperar a que un administrador lo apruebe o rechace."
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+                ]])
+            )
+
+            return
+
+        moneda = get_moneda(user_id)
+
+        keyboard = [
+            [
+                InlineKeyboardButton("🇨🇺 CUP", callback_data="cup"),
+                InlineKeyboardButton("📲 Saldo móvil", callback_data="saldo")
+            ],
+            [
+                InlineKeyboardButton("💳 MLC", callback_data="mlc"),
+                InlineKeyboardButton("🔶 TRX", callback_data="trx")
+            ],
+            [
+                InlineKeyboardButton("🪙 USDT", callback_data="usdt")
+            ],
+            [
+                InlineKeyboardButton("🔄 Cambiar cuenta", callback_data="cambio_cuenta")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+            ]
+        ]
+
+        await query.edit_message_text(
+            text=(
+                "💳 DEPÓSITO\n\n"
+                f"🏆 Cuenta donde se añadirá el saldo: {moneda}\n\n"
+                "📌 Pasos:\n"
+                "1️⃣ Elige método de pago\n"
+                "2️⃣ Escribe tu número de 8 dígitos\n"
+                "3️⃣ Escribe el monto\n"
+                "4️⃣ Envía captura clara\n"
+                "5️⃣ Espera aprobación\n\n"
+                "👇 Selecciona método:"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # =========================================
+    # METODOS DE PAGO
+    # =========================================
+    elif data in ["cup", "saldo", "mlc", "trx", "usdt"]:
+
+        metodos = {
+            "cup": "🇨🇺 CUP",
+            "saldo": "📲 Saldo móvil",
+            "mlc": "💳 MLC",
+            "trx": "🔶 TRX",
+            "usdt": "🪙 USDT"
+        }
+
+        context.user_data["metodo_pago"] = metodos[data]
+        context.user_data["esperando_numero"] = True
+
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"✅ Método seleccionado:\n{metodos[data]}\n\n"
+                "📲 Ahora escribe tu número.\n\n"
+                "⚠️ Debe tener exactamente 8 dígitos.\n"
+                "Ejemplo: 55555555"
+            )
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+        # =========================================
+    # RETIRAR
+    # =========================================
+    elif data == "retirar":
+
+        if tiene_retiro_pendiente(user_id):
+
+            await query.edit_message_text(
+                text=(
+                    "⏳ Ya tienes un retiro pendiente.\n\n"
+                    "Debes esperar a que un administrador lo revise."
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+                ]])
+            )
+
+            return
+
+        moneda = get_moneda(user_id)
+        saldo = get_saldo(user_id, moneda)
+
+        if saldo <= 0:
+
+            await query.edit_message_text(
+                text=(
+                    "❌ No tienes saldo disponible para retirar.\n\n"
+                    f"🏆 Moneda: {moneda}\n"
+                    f"💰 Saldo: {saldo} {moneda}"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+                ]])
+            )
+
+            return
+
+        context.user_data["esperando_monto_retiro"] = True
+
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(update.effective_chat.id, context)
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "💸 RETIRO\n\n"
+                f"🏆 Moneda: {moneda}\n"
+                f"💰 Saldo disponible: {saldo} {moneda}\n\n"
+                "Escribe el monto que quieres retirar:"
+            )
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+
+    # =========================================
+    # APROBAR DEPOSITO
+    # =========================================
+    elif data.startswith("aprobar_dep_"):
+
+        if user_id not in ADMIN_IDS:
+            await query.answer("No eres admin", show_alert=True)
+            return
+
+        deposito_id = int(data.replace("aprobar_dep_", ""))
+
+        cursor.execute("""
+        SELECT user_id, chat_id, moneda, monto, estado
+        FROM depositos WHERE id=?
+        """, (deposito_id,))
+
+        dep = cursor.fetchone()
+
+        if not dep:
+            await query.answer("Depósito no encontrado", show_alert=True)
+            return
+
+        dep_user_id, chat_id, moneda, monto, estado = dep
+
+        if estado != "pendiente":
+            await query.answer("Ya fue revisado", show_alert=True)
+            return
+
+        bonus = 0
+
+        if es_primer_deposito(dep_user_id):
+            bonus = monto * 0.20
+
+        total = monto + bonus
+
+        nuevo_saldo = add_saldo(
+            dep_user_id,
+            moneda,
+            total
+        )
+
+        cursor.execute(
+            "UPDATE depositos SET estado='aprobado' WHERE id=?",
+            (deposito_id,)
+        )
+
+        db.commit()
+
+        guardar_historial(
+            dep_user_id,
+            "Depósito aprobado",
+            moneda,
+            monto
+        )
+
+        if bonus > 0:
+
+            guardar_historial(
+                dep_user_id,
+                "Bono primer depósito",
+                moneda,
+                bonus
+            )
+
+        log_admin(
+            user_id,
+            "Aprobó depósito",
+            f"Depósito {deposito_id} / Usuario {dep_user_id}"
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ DEPÓSITO APROBADO\n\n"
+                f"💰 Depósito: {monto} {moneda}\n"
+                f"🎁 Bono: {bonus} {moneda}\n"
+                f"🏦 Nuevo saldo: {nuevo_saldo} {moneda}"
+            )
+        )
+
+        try:
+            await query.edit_message_caption(
+                caption=query.message.caption + f"\n\n✅ APROBADO\n🎁 Bono: {bonus} {moneda}"
+            )
+        except:
+            await query.edit_message_text("✅ Depósito aprobado")
+
+    # =========================================
+    # RECHAZAR DEPOSITO
+    # =========================================
+    elif data.startswith("rechazar_dep_"):
+
+        if user_id not in ADMIN_IDS:
+            await query.answer("No eres admin", show_alert=True)
+            return
+
+        deposito_id = int(data.replace("rechazar_dep_", ""))
+
+        cursor.execute("""
+        SELECT user_id, chat_id, moneda, monto, estado
+        FROM depositos WHERE id=?
+        """, (deposito_id,))
+
+        dep = cursor.fetchone()
+
+        if not dep:
+            await query.answer("Depósito no encontrado", show_alert=True)
+            return
+
+        dep_user_id, chat_id, moneda, monto, estado = dep
+
+        if estado != "pendiente":
+            await query.answer("Ya fue revisado", show_alert=True)
+            return
+
+        cursor.execute(
+            "UPDATE depositos SET estado='rechazado' WHERE id=?",
+            (deposito_id,)
+        )
+
+        db.commit()
+
+        guardar_historial(
+            dep_user_id,
+            "Depósito rechazado",
+            moneda,
+            monto
+        )
+
+        log_admin(
+            user_id,
+            "Rechazó depósito",
+            f"Depósito {deposito_id} / Usuario {dep_user_id}"
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Tu depósito fue rechazado por los administradores."
+        )
+
+        try:
+            await query.edit_message_caption(
+                caption=query.message.caption + "\n\n❌ RECHAZADO"
+            )
+        except:
+            await query.edit_message_text("❌ Depósito rechazado")
+
+    # =========================================
+    # APROBAR RETIRO
+    # =========================================
+    elif data.startswith("aprobar_ret_"):
+
+        if user_id not in ADMIN_IDS:
+            await query.answer("No eres admin", show_alert=True)
+            return
+
+        retiro_id = int(data.replace("aprobar_ret_", ""))
+
+        cursor.execute("""
+        SELECT user_id, chat_id, moneda, monto, cuenta, estado
+        FROM retiros WHERE id=?
+        """, (retiro_id,))
+
+        ret = cursor.fetchone()
+
+        if not ret:
+            await query.answer("Retiro no encontrado", show_alert=True)
+            return
+
+        ret_user_id, chat_id, moneda, monto, cuenta, estado = ret
+
+        if estado != "pendiente":
+            await query.answer("Ya fue revisado", show_alert=True)
+            return
+
+        nuevo = quitar_saldo(
+            ret_user_id,
+            moneda,
+            monto
+        )
+
+        if nuevo is None:
+
+            cursor.execute(
+                "UPDATE retiros SET estado='rechazado' WHERE id=?",
+                (retiro_id,)
+            )
+
+            db.commit()
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Retiro rechazado: saldo insuficiente."
+            )
+
+            await query.edit_message_text(
+                "❌ Retiro rechazado por saldo insuficiente."
+            )
+
+            return
+
+        cursor.execute(
+            "UPDATE retiros SET estado='aprobado' WHERE id=?",
+            (retiro_id,)
+        )
+
+        db.commit()
+
+        guardar_historial(
+            ret_user_id,
+            "Retiro aprobado",
+            moneda,
+            monto
+        )
+
+        log_admin(
+            user_id,
+            "Aprobó retiro",
+            f"Retiro {retiro_id} / Usuario {ret_user_id}"
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ RETIRO APROBADO\n\n"
+                f"💸 Retiro: {monto} {moneda}\n"
+                f"🏦 Nuevo saldo: {nuevo} {moneda}"
+            )
+        )
+
+        await query.edit_message_text(
+            text=(
+                "✅ RETIRO APROBADO\n\n"
+                f"ID retiro: {retiro_id}\n"
+                f"Usuario: {ret_user_id}\n"
+                f"Monto: {monto} {moneda}\n"
+                f"Cuenta: {cuenta}"
+            )
+        )
+        # =========================================
+    # RECHAZAR RETIRO
+    # =========================================
+    elif data.startswith("rechazar_ret_"):
+
+        if user_id not in ADMIN_IDS:
+            await query.answer("No eres admin", show_alert=True)
+            return
+
+        retiro_id = int(data.replace("rechazar_ret_", ""))
+
+        cursor.execute("""
+        SELECT user_id, chat_id, moneda, monto, estado
+        FROM retiros WHERE id=?
+        """, (retiro_id,))
+
+        ret = cursor.fetchone()
+
+        if not ret:
+            await query.answer("Retiro no encontrado", show_alert=True)
+            return
+
+        ret_user_id, chat_id, moneda, monto, estado = ret
+
+        if estado != "pendiente":
+            await query.answer("Ya fue revisado", show_alert=True)
+            return
+
+        cursor.execute(
+            "UPDATE retiros SET estado='rechazado' WHERE id=?",
+            (retiro_id,)
+        )
+
+        db.commit()
+
+        guardar_historial(
+            ret_user_id,
+            "Retiro rechazado",
+            moneda,
+            monto
+        )
+
+        log_admin(
+            user_id,
+            "Rechazó retiro",
+            f"Retiro {retiro_id} / Usuario {ret_user_id}"
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Tu retiro fue rechazado por los administradores."
+        )
+
+        await query.edit_message_text(
+            "❌ Retiro rechazado."
+        )
+
+    # =========================================
+    # HISTORIAL
+    # =========================================
+    elif data == "historial":
+
+        cursor.execute("""
+        SELECT tipo, moneda, monto, fecha
+        FROM historial
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 10
+        """, (user_id,))
+
+        datos = cursor.fetchall()
+
+        if not datos:
+            texto = "📜 No tienes historial todavía."
+        else:
+            texto = "📜 HISTORIAL\n\n"
+
+            for tipo, moneda, monto, fecha in datos:
+                texto += (
+                    f"• {tipo}\n"
+                    f"💰 {monto} {moneda}\n"
+                    f"📅 {fecha}\n\n"
+                )
+
+        await query.edit_message_text(
+            text=texto,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Atrás", callback_data="dinero")
+            ]])
+        )
+
+    # =========================================
+    # ADMIN PANEL
+    # =========================================
+    elif data == "admin_panel":
+
+        if user_id not in ADMIN_IDS:
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM usuarios")
+        usuarios = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM depositos WHERE estado='pendiente'")
+        dep_pend = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM retiros WHERE estado='pendiente'")
+        ret_pend = cursor.fetchone()[0]
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "📥 Depósitos pendientes",
+                    callback_data="admin_depositos"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💸 Retiros pendientes",
+                    callback_data="admin_retiros"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Estadísticas",
+                    callback_data="admin_stats"
+                )
+            ]
+        ]
+
+        await query.edit_message_text(
+            text=(
+                "👑 PANEL ADMIN\n\n"
+                f"👥 Usuarios: {usuarios}\n"
+                f"📥 Depósitos pendientes: {dep_pend}\n"
+                f"💸 Retiros pendientes: {ret_pend}"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "admin_depositos":
+
+        if user_id not in ADMIN_IDS:
+            return
+
+        cursor.execute("""
+        SELECT id, user_id, moneda, monto, fecha
+        FROM depositos
+        WHERE estado='pendiente'
+        ORDER BY id DESC
+        LIMIT 10
+        """)
+
+        deps = cursor.fetchall()
+
+        texto = "📥 DEPÓSITOS PENDIENTES\n\n"
+
+        if not deps:
+            texto += "No hay depósitos pendientes."
+        else:
+            for d in deps:
+                texto += (
+                    f"ID: {d[0]} | Usuario: {d[1]}\n"
+                    f"💰 {d[3]} {d[2]}\n"
+                    f"📅 {d[4]}\n\n"
+                )
+
+        await query.edit_message_text(
+            text=texto,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Panel", callback_data="admin_panel")
+            ]])
+        )
+
+    elif data == "admin_retiros":
+
+        if user_id not in ADMIN_IDS:
+            return
+
+        cursor.execute("""
+        SELECT id, user_id, moneda, monto, cuenta, fecha
+        FROM retiros
+        WHERE estado='pendiente'
+        ORDER BY id DESC
+        LIMIT 10
+        """)
+
+        rets = cursor.fetchall()
+
+        texto = "💸 RETIROS PENDIENTES\n\n"
+
+        if not rets:
+            texto += "No hay retiros pendientes."
+        else:
+            for r in rets:
+                texto += (
+                    f"ID: {r[0]} | Usuario: {r[1]}\n"
+                    f"💰 {r[3]} {r[2]}\n"
+                    f"🏦 {r[4]}\n"
+                    f"📅 {r[5]}\n\n"
+                )
+
+        await query.edit_message_text(
+            text=texto,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Panel", callback_data="admin_panel")
+            ]])
+        )
+
+    elif data == "admin_stats":
+
+        if user_id not in ADMIN_IDS:
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM usuarios")
+        usuarios = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM depositos WHERE estado='aprobado'")
+        dep_aprob = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM retiros WHERE estado='aprobado'")
+        ret_aprob = cursor.fetchone()[0]
+
+        await query.edit_message_text(
+            text=(
+                "📊 ESTADÍSTICAS\n\n"
+                f"👥 Usuarios registrados: {usuarios}\n"
+                f"✅ Depósitos aprobados: {dep_aprob}\n"
+                f"💸 Retiros aprobados: {ret_aprob}"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Panel", callback_data="admin_panel")
+            ]])
+        )
+
+    # =========================================
+    # BOTONES SIMPLES
+    # =========================================
+    # =========================================
+    # LOGS ADMIN
+    # =========================================
+    elif data == "admin_logs":
+
+        if user_id not in ADMIN_IDS:
+            return
+
+        cursor.execute("""
+        SELECT admin_id, accion, detalle, fecha
+        FROM logs
+        ORDER BY id DESC
+        LIMIT 15
+        """)
+
+        logs = cursor.fetchall()
+
+        if not logs:
+
+            texto = "📜 No hay logs todavía."
+
+        else:
+
+            texto = "📜 LOGS ADMIN\n\n"
+
+            for admin_id, accion, detalle, fecha in logs:
+
+                texto += (
+                    f"👤 Admin: {admin_id}\n"
+                    f"⚡ {accion}\n"
+                    f"📌 {detalle}\n"
+                    f"📅 {fecha}\n\n"
+                )
+
+        await query.edit_message_text(
+            text=texto,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Panel",
+                    callback_data="admin_panel"
+                )
+            ]])
+        )
+    elif data == "apostar":
+
+        await query.edit_message_text(
+            text="🎯 Apuestas próximamente.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Atrás", callback_data="menu")
+            ]])
+        )
+
+    elif data == "juegos":
+
+        await query.edit_message_text(
+            text="🎮 Juegos próximamente.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Atrás", callback_data="menu")
+            ]])
+        )
+
+    elif data == "mas":
+
+        await query.edit_message_text(
+            text="➕ Más opciones próximamente.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Atrás", callback_data="menu")
+            ]])
+        )
+
+    elif data == "ayuda":
+
+        await query.edit_message_text(
+            text="❓ Soporte: @TuUsuario",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Atrás", callback_data="menu")
+            ]])
+        )
+
+    elif data == "menu":
+
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+       
+
+
+# =========================================
+# RECIBIR TEXTO
+# =========================================
+async def recibir_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    crear_usuario(update.effective_user)
+
+    texto = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    if context.user_data.get("esperando_numero"):
+
+        if len(texto) != 8 or not texto.isdigit():
+
+            await update.message.reply_text(
+                "❌ Número inválido\n\n"
+                "📌 Debe tener exactamente 8 dígitos.\n"
+                "Ejemplo: 55555555"
+            )
+
+            return
+
+        context.user_data["numero"] = texto
+        context.user_data["esperando_numero"] = False
+        context.user_data["esperando_monto"] = True
+
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="💵 Ahora escribe el monto que depositaste:"
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+        return
+
+    if context.user_data.get("esperando_monto"):
+
+        try:
+            monto = float(texto.replace(",", "."))
+        except:
+
+            await update.message.reply_text(
+                "❌ Monto inválido. Ejemplo: 100"
+            )
+
+            return
+
+        if monto <= 0:
+
+            await update.message.reply_text(
+                "❌ El monto debe ser mayor que 0."
+            )
+
+            return
+
+        moneda = get_moneda(user_id)
+
+        context.user_data["monto_deposito"] = monto
+        context.user_data["moneda_deposito"] = moneda
+        context.user_data["esperando_monto"] = False
+        context.user_data["esperando_captura"] = True
+
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "📸 Ahora manda una captura clara.\n\n"
+                f"💰 Monto: {monto} {moneda}\n\n"
+                "Debe verse fecha y hora."
+            )
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+        return
+
+    if context.user_data.get("esperando_monto_retiro"):
+
+        try:
+            monto = float(texto.replace(",", "."))
+        except:
+
+            await update.message.reply_text(
+                "❌ Monto inválido. Ejemplo: 50"
+            )
+
+            return
+
+        moneda = get_moneda(user_id)
+        saldo = get_saldo(user_id, moneda)
+
+        if monto <= 0:
+
+            await update.message.reply_text(
+                "❌ El monto debe ser mayor que 0."
+            )
+
+            return
+
+        if monto > saldo:
+
+            await update.message.reply_text(
+                f"❌ Saldo insuficiente.\n\nTienes {saldo} {moneda}"
+            )
+
+            return
+
+        context.user_data["monto_retiro"] = monto
+        context.user_data["moneda_retiro"] = moneda
+        context.user_data["esperando_monto_retiro"] = False
+        context.user_data["esperando_cuenta_retiro"] = True
+
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "🏦 Ahora escribe la cuenta, "
+                "tarjeta o wallet donde quieres recibir el retiro."
+            )
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+        return
+
+    if context.user_data.get("esperando_cuenta_retiro"):
+
+        cuenta = texto
+
+        monto = context.user_data.get("monto_retiro")
+        moneda = context.user_data.get("moneda_retiro")
+
+        cursor.execute("""
+        INSERT INTO retiros (user_id, chat_id, moneda, monto, cuenta)
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            update.effective_chat.id,
+            moneda,
+            monto,
+            cuenta
+        ))
+
+        db.commit()
+
+        retiro_id = cursor.lastrowid
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "✅ Aprobar",
+                callback_data=f"aprobar_ret_{retiro_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Rechazar",
+                callback_data=f"rechazar_ret_{retiro_id}"
+            )
+        ]]
+
+        await context.bot.send_message(
+            chat_id=GRUPO_ID,
+            text=(
+                "💸 NUEVO RETIRO\n\n"
+                f"🧾 ID retiro: {retiro_id}\n"
+                f"👤 Usuario: {update.effective_user.first_name}\n"
+                f"🆔 ID: {user_id}\n\n"
+                f"🏆 Moneda: {moneda}\n"
+                f"💰 Monto: {monto} {moneda}\n"
+                f"🏦 Cuenta/Wallet:\n{cuenta}\n\n"
+                "⏳ Estado: pendiente"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        context.user_data["esperando_cuenta_retiro"] = False
+
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        await borrar_anterior(
+            update.effective_chat.id,
+            context
+        )
+
+        mensaje = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "✅ Tu solicitud de retiro fue enviada.\n\n"
+                "🕒 Espera aprobación."
+            )
+        )
+
+        context.chat_data["ultimo_mensaje"] = mensaje.message_id
+        return
+
+
+# =========================================
+# RECIBIR FOTO
+# =========================================
+async def recibir_captura(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not context.user_data.get("esperando_captura"):
+        return
+
+    if not update.message.photo:
+        return
+
+    usuario = update.effective_user
+
+    crear_usuario(usuario)
+
+    metodo = context.user_data.get("metodo_pago")
+    numero = context.user_data.get("numero")
+    monto = context.user_data.get("monto_deposito")
+    moneda = context.user_data.get("moneda_deposito")
+    foto = update.message.photo[-1].file_id
+
+    cursor.execute("""
+    INSERT INTO depositos (user_id, chat_id, metodo, numero, moneda, monto, file_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        usuario.id,
+        update.effective_chat.id,
+        metodo,
+        numero,
+        moneda,
+        monto,
+        foto
+    ))
+
+    db.commit()
+
+    deposito_id = cursor.lastrowid
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "✅ Aprobar",
+            callback_data=f"aprobar_dep_{deposito_id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Rechazar",
+            callback_data=f"rechazar_dep_{deposito_id}"
+        )
+    ]]
+
+    username = (
+        f"@{usuario.username}"
+        if usuario.username
+        else "Sin username"
+    )
+
+    await context.bot.send_photo(
+        chat_id=GRUPO_ID,
+        photo=foto,
+        caption=(
+            "📥 NUEVO DEPÓSITO\n\n"
+            f"🧾 ID depósito: {deposito_id}\n"
+            f"👤 Usuario: {usuario.first_name}\n"
+            f"🆔 ID: {usuario.id}\n"
+            f"🔗 Username: {username}\n\n"
+            f"💳 Método: {metodo}\n"
+            f"📱 Número: {numero}\n"
+            f"🏆 Moneda: {moneda}\n"
+            f"💰 Monto: {monto} {moneda}\n\n"
+            "⏳ Estado: pendiente"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    context.user_data["esperando_captura"] = False
+
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+    await borrar_anterior(
+        update.effective_chat.id,
+        context
+    )
+
+    mensaje = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            "✅ Tu depósito fue enviado.\n\n"
+            "🕒 Espera aprobación de los administradores."
+        )
+    )
+
+    context.chat_data["ultimo_mensaje"] = mensaje.message_id
+
+
+# =========================================
+# COMANDOS
+# =========================================
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        f"🆔 Tu ID es:\n{update.effective_user.id}"
+    )
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📥 Depósitos pendientes",
+                callback_data="admin_depositos"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💸 Retiros pendientes",
+                callback_data="admin_retiros"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Estadísticas",
+                callback_data="admin_stats"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "👑 PANEL ADMIN",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def cmd_addsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        user_id = int(context.args[0])
+        moneda = context.args[1].upper()
+        monto = float(context.args[2])
+
+    except:
+
+        await update.message.reply_text(
+            "Uso: /addsaldo ID MONEDA MONTO"
+        )
+
+        return
+
+    if moneda not in MONEDAS:
+
+        await update.message.reply_text(
+            "Moneda inválida."
+        )
+
+        return
+
+    nuevo = add_saldo(
+        user_id,
+        moneda,
+        monto
+    )
+
+    guardar_historial(
+        user_id,
+        "Saldo añadido por admin",
+        moneda,
+        monto
+    )
+
+    log_admin(
+        update.effective_user.id,
+        "Añadió saldo",
+        f"{monto} {moneda} a {user_id}"
+    )
+
+    await update.message.reply_text(
+        f"✅ Añadidos {monto} {moneda}\n"
+        f"Nuevo saldo: {nuevo} {moneda}"
+    )
+
+
+async def cmd_quitarsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        user_id = int(context.args[0])
+        moneda = context.args[1].upper()
+        monto = float(context.args[2])
+
+    except:
+
+        await update.message.reply_text(
+            "Uso: /quitarsaldo ID MONEDA MONTO"
+        )
+
+        return
+
+    if moneda not in MONEDAS:
+
+        await update.message.reply_text(
+            "Moneda inválida."
+        )
+
+        return
+
+    nuevo = quitar_saldo(
+        user_id,
+        moneda,
+        monto
+    )
+
+    if nuevo is None:
+
+        await update.message.reply_text(
+            "❌ Saldo insuficiente."
+        )
+
+        return
+
+    guardar_historial(
+        user_id,
+        "Saldo quitado por admin",
+        moneda,
+        monto
+    )
+
+    log_admin(
+        update.effective_user.id,
+        "Quitó saldo",
+        f"{monto} {moneda} a {user_id}"
+    )
+
+    await update.message.reply_text(
+        f"✅ Quitados {monto} {moneda}\n"
+        f"Nuevo saldo: {nuevo} {moneda}"
+    )
+
+
+async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        user_id = int(context.args[0])
+
+    except:
+
+        await update.message.reply_text(
+            "Uso: /saldo ID"
+        )
+
+        return
+
+    texto = f"💰 SALDO DEL USUARIO {user_id}\n\n"
+
+    for moneda in MONEDAS:
+
+        texto += (
+            f"{moneda}: "
+            f"{get_saldo(user_id, moneda)}\n"
+        )
+
+    await update.message.reply_text(texto)
+
+
+# =========================================
+# ERROR
+# =========================================
+async def error_handler(update, context):
+
+    print(f"ERROR: {context.error}")
+
+
+# =========================================
+# APP
+# ========================
+app = Application.builder().token(
+    TOKEN
+).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("id", cmd_id))
+app.add_handler(CommandHandler("admin", cmd_admin))
+app.add_handler(CommandHandler("addsaldo", cmd_addsaldo))
+app.add_handler(CommandHandler("quitarsaldo", cmd_quitarsaldo))
+app.add_handler(CommandHandler("saldo", cmd_saldo))
+
+app.add_handler(CallbackQueryHandler(botones))
+
+app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        recibir_texto
+    )
+)
+
+app.add_handler(
+    MessageHandler(
+        filters.PHOTO,
+        recibir_captura
+    )
+)
+
+app.add_error_handler(error_handler)
+
+print("✅ Bot activo...")
+
+app.run_polling()
